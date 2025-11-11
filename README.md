@@ -18,13 +18,14 @@ This repo is designed for following purposes:
 
 ## TODO
 
-- [ ] sm80 fp16 gemm
+- [x] sm80 fp16 gemm
 - [ ] sm90 fp16 gemm
 - [ ] sm90 fp8 deepgemm
 - [ ] fused layernorm + convert fp8 kernel
 - [ ] fused silu_matmul + convert fp8 kernel
 - [ ] sm100 fp8 deepgemm
 - [ ] sm100 nvfp4 gemm
+- [ ] predicated kernels
 
 ## Acknowledgments
 

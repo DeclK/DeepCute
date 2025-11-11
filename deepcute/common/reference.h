@@ -116,15 +116,3 @@ void cpu_cosine_similarity(T *x, T *y, size_t n, float threshold = 0.999) {
     printf_fail("check fail, cos_similarity = %f\n", cos_similarity);
   }
 }
-
-template <typename Kernel>
-inline float launch_with_timer(Kernel kernel, int repeat = 1000,
-                               cudaStream_t stream = 0) {
-  GpuTimer timer;
-  timer.start(stream);
-  for (int iter = 0; iter < repeat; iter++) {
-    kernel();
-  }
-  timer.stop();
-  return timer.elapsed_millis() / repeat;
-}

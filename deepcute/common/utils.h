@@ -38,30 +38,6 @@ template <typename T> inline auto make_cutlass_colmajor_tensor(int m, int n) {
   return tensor;
 }
 
-inline int get_max_smem_size() {
-  int max_shared_mem;
-  cudaDeviceGetAttribute(&max_shared_mem,
-                         cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
-  return max_shared_mem;
-}
-
-template <typename Kernel> void config_smem(Kernel kernel, int smem_size) {
-  if (smem_size >= 32 * 1024) {
-    if (cudaFuncSetAttribute(kernel,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             smem_size) != cudaSuccess) {
-      int max_shared_mem = get_max_smem_size();
-      cudaError_t err = cudaGetLastError();
-      std::cerr << "Set kernel attribute failed: " << cudaGetErrorString(err)
-                << std::endl;
-      std::cerr
-          << "Kernel required " << smem_size
-          << " shared memory but the max shared memory per block optin is: "
-          << max_shared_mem << std::endl;
-    }
-  }
-}
-
 int get_device_sm() {
   int current_device;
   int device_sms;
