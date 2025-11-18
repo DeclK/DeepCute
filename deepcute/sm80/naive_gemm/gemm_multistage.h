@@ -9,8 +9,6 @@ struct GemmMultiStageSM80{
 
     // mma atom
     using mma_op = SM80_16x8x16_F16F16F16F16_TN;
-    using mma_traits = MMA_Traits<mma_op>;
-    using mma_atom = MMA_Atom<mma_traits>;
 
     // copy atom
     // g2s copy
@@ -53,7 +51,7 @@ struct GemmMultiStageSM80{
                                                 make_shape(_32{}, _32{}, _2{})));
     
     // tiled mma
-    using TiledMMA = decltype(make_tiled_mma(mma_atom{},
+    using TiledMMA = decltype(make_tiled_mma(mma_op{},
                                              make_layout(make_shape(_2{}, _2{})), // warp layout
                                              make_tile(_32{}, _32{}, _16{}))); // tile mnk
 
