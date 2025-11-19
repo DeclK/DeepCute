@@ -12,24 +12,13 @@ struct GemmMultiStageSM80{
 
     // copy atom
     // g2s copy
-    using g2s_copy_op = SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>;
-    using g2s_copy_traits = Copy_Traits<g2s_copy_op>;
-    using g2s_copy_atom = Copy_Atom<g2s_copy_traits, Dtype>;
-
+    using g2s_copy_atom = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, Dtype>;
     // s2r copy
-    using s2r_copy_op = SM75_U32x4_LDSM_N;
-    using s2r_copy_traits = Copy_Traits<s2r_copy_op>;
-    using s2r_copy_atom = Copy_Atom<s2r_copy_traits, Dtype>;
-
+    using s2r_copy_atom = Copy_Atom<SM75_U32x4_LDSM_N, Dtype>;
     // r2s copy
-    using r2s_copy_op = UniversalCopy<uint32_t>;
-    using r2s_copy_traits = Copy_Traits<r2s_copy_op>;
-    using r2s_copy_atom = Copy_Atom<r2s_copy_traits, Dtype>;
-
+    using r2s_copy_atom = Copy_Atom<UniversalCopy<uint32_t>, Dtype>;
     // s2g copy
-    using s2g_copy_op = UniversalCopy<uint128_t>;
-    using s2g_copy_traits = Copy_Traits<s2g_copy_op>;
-    using s2g_copy_atom = Copy_Atom<s2g_copy_traits, Dtype>;
+    using s2g_copy_atom = Copy_Atom<UniversalCopy<uint128_t>, Dtype>;
 
     // we build everything based on (32, 32, 16) tile
     static_assert(size<0>(CTATile{}) % 32 == 0);
