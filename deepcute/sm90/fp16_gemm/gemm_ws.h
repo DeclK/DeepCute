@@ -166,8 +166,8 @@ struct GemmFp16SM90 {
         while (tile_info.is_valid) {
 
             for (int i = 0; i < num_k; i++) {
-                smem.empty_barriers[i].wait(pipe_states.phase);
-                smem.full_barriers[i].arrive_and_expect_tx(Expect_Btyes_AB);
+                smem.empty_barriers[pipe_states.stage_idx].wait(pipe_states.phase);
+                smem.full_barriers[pipe_states.stage_idx].arrive_and_expect_tx(Expect_Btyes_AB);
                 copy(tma.with(reinterpret_cast<uint64_t*>(smem.empty_barriers[i])),
                      t_g2s_gA(_, _, _, tile_info.m_idx, i), t_g2s_sA);
                 copy(tma.with(reinterpret_cast<uint64_t*>(smem.empty_barriers[i])),
@@ -186,7 +186,67 @@ struct GemmFp16SM90 {
     }
 
     CUTE_DEVICE
-    void consumer(){}
+    void consumer(SharedStorage &smem,
+                  TmaDescriptor const &tma_a,
+                  TmaDescriptor const &tma_b,
+                  TmaDescriptor const &tma_c,
+                  int M, int N, int K) {
+        // make the smem tensor
+        Tensor sA = make_tensor(make_smem_ptr<T>(smem.A.data()), SmemLayoutA{});    // (cta_m, cta_k, k)
+        Tensor sB = make_tensor(make_smem_ptr<T>(smem.B.data()), SmemLayoutB{});    // (cta_n, cta_k, k)
+        Tensor sC = make_tensor(make_smem_ptr<T>(smem.C.data()), SmemLayoutC{});
+        // make C gmem/tma tensor
+        Tensor C = tma_a.get_tma_tensor(make_shape(M, N));
+        Tensor gC = local_tile(C, CTATile{}, make_coord(_, _, _), Step<_1, _1, X>{}); // (cta_m, cta_n, m, n)
+
+        PersistantScheduler scheduler;
+        PipelineStates pipe_states{0, 0};
+
+        // mma 
+        TiledMMA tiled_mma;
+        tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+        int warp_group_id_in_consumer = __shfl_sync(0xffffffff, threadIdx.x / 128 - 1, 0);
+        // auto thr_mma = tiled_mma.get_slice(threadIdx.x - 128); // TODO: try this
+        auto thr_mma = tiled_mma.get_slice(warp_group_id_in_consumer * 128);
+        // mma partition
+        Tensor t_sA = thr_mma.partition_A(sA); // ((mma_m, mma_k), rest_m, rest_k, stages)
+        Tensor t_sB = thr_mma.partition_B(sB); // ((mma_n, mma_k), rest_n, rest_k, stages)
+
+        // mma fragments
+        Tensor t_rA = thr_mma.partition_fragment_A(t_sA);   // (1, rest_m, rest_k, stages) matrix descriptor
+        Tensor t_rB = thr_mma.partition_fragment_B(t_sB);   // (1, rest_n, rest_k, stages)
+        Tensor t_rC = thr_mma.partition_fragment_C(make_layout(make_shape(size<0>(CTATile{}), size<1>(CTATile{})), 
+                                                               LayoutRight{})); // (COPY_C, rest_m, rest_n)
+
+        // ctas to launch arrive, make sure cta in the same cluster complete mma together
+        uint32_t lane_idx = threadIdx.x % 32;
+        uint32_t predicate = MultiCast ? lane_idx == 0 : lane_idx < 2;
+
+        // to save register C to smem first then use tma to copy to gmem
+        R2STiledCopy tiled_r2s;
+        auto thr_r2s = tiled_r2s.get_slice(threadIdx.x - 128);
+        auto t_r2s_rC = thr_r2s.retile_S(t_rC);     // (CPY, rest_m = CTA_M / MMA_M, rest_n)
+        auto t_r2s_sC = thr_r2s.partition_D(sC);    // (CPY, rest_n = EPI_M / MMA_M, rest_n, PIPE)
+
+        // try to do the loop, and see what is missing
+        int num_k = K / size<2>(CTATile{});
+        auto tile_info = scheduler.get_tile_id(); 
+        while (tile_info.is_valid) {
+            // wait the full barrier
+            clear(t_rC);
+            for (int i = 0; i < num_k; i++) {
+                // do mma
+                smem.full_barriers[pipe_states.stage_idx].wait(pipe_states.phase);
+                gemm(tiled_mma, t_rA(_, _, _, pipe_states.stage_idx), t_rB(_, _, _, pipe_states.stage_idx), t_rC);
+                pipe_states++;
+                smem.empty_barriers[pipe_states.stage_idx].arrive(lane_idx, predicate);
+            }
+
+            // TODO: epilogue
+            scheduler.advance_next_tile();
+            tile_info = scheduler.get_tile_id();
+        }
+    }
 
 
     inline static cudaLaunchConfig_t get_launch_config(){}
