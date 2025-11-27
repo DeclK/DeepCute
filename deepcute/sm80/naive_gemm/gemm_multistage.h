@@ -20,25 +20,6 @@ struct GemmMultiStageSM80{
     // s2g copy
     using s2g_copy_atom = Copy_Atom<UniversalCopy<uint128_t>, Dtype>;
 
-    // we build everything based on (32, 32, 16) tile
-    static_assert(size<0>(CTATile{}) % 32 == 0);
-    static_assert(size<1>(CTATile{}) % 32 == 0);
-    static_assert(size<2>(CTATile{}) % 16 == 0);
-
-    // smem swizzle
-    using SmemAtomAB = decltype(composition(Swizzle<2, 3, 3>{},
-                                            make_layout(Shape<_32,_32>{}, 
-                                                        Stride<_32,_1>{})));
-    using SmemAtomC = decltype(composition(Swizzle<2, 3, 3>{},
-                                            make_layout(Shape<_32,_32>{}, 
-                                                        Stride<_32,_1>{})));
-    using SmemLayoutA = decltype(tile_to_shape(SmemAtomAB{},
-                                                make_shape(size<0>(CTATile{}), size<2>(CTATile{}), Int<Stages>{})));
-    using SmemLayoutB = decltype(tile_to_shape(SmemAtomAB{},
-                                                make_shape(size<1>(CTATile{}), size<2>(CTATile{}), Int<Stages>{})));
-    using SmemLayoutC = decltype(tile_to_shape(SmemAtomC{},
-                                                make_shape(_32{}, _32{}, _2{})));
-    
     // tiled mma
     using TiledMMA = decltype(make_tiled_mma(mma_op{},
                                              make_layout(make_shape(_2{}, _2{})), // warp layout
@@ -58,6 +39,25 @@ struct GemmMultiStageSM80{
     using S2GTiledCopy = decltype(make_tiled_copy(s2g_copy_atom{},
                                                   make_layout(make_shape(_32{}, _4{}), make_stride(_4{}, _1{})), // thr layout
                                                   make_layout(make_shape(_1{}, _8{})))); // val layout
+
+    // smem swizzle
+    using SmemAtomAB = decltype(composition(Swizzle<2, 3, 3>{},
+                                            make_layout(Shape<_32,_32>{}, 
+                                                        Stride<_32,_1>{})));
+    using SmemAtomC = decltype(composition(Swizzle<2, 3, 3>{},
+                                            make_layout(Shape<_32,_32>{}, 
+                                                        Stride<_32,_1>{})));
+    using SmemLayoutA = decltype(tile_to_shape(SmemAtomAB{},
+                                                make_shape(size<0>(CTATile{}), size<2>(CTATile{}), Int<Stages>{})));
+    using SmemLayoutB = decltype(tile_to_shape(SmemAtomAB{},
+                                                make_shape(size<1>(CTATile{}), size<2>(CTATile{}), Int<Stages>{})));
+    using SmemLayoutC = decltype(tile_to_shape(SmemAtomC{},
+                                                make_shape(_32{}, _32{}, _2{})));
+                                                  
+    // cta tile must be divisible by all second level tile
+    static_assert(size<0>(CTATile{}) % 32 == 0);
+    static_assert(size<1>(CTATile{}) % 32 == 0);
+    static_assert(size<2>(CTATile{}) % 32 == 0);
 
     CUTLASS_DEVICE
     void operator()(void* __restrict__ Aptr,

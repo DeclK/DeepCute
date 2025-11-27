@@ -15,8 +15,7 @@ struct GemmFp16SM90 {
     using ClusterShape = std::conditional_t<Multicast, decltype(make_shape(_2{}, _1{}, _1{})),  decltype(make_shape(_1{}, _1{}, _1{}))>
 
     // mma atom
-    using ABMajor = GMMA::Major::K;
-    using mma_op = GMMA::MMA_64x128x16_F16F16F16_SS<ABMajor, ABMajor>;
+    using mma_op = GMMA::MMA_64x128x16_F16F16F16_SS<GMMA::Major::K,  GMMA::Major::K>;
 
     // copy atom
     // g2s copy, using tma
@@ -27,31 +26,30 @@ struct GemmFp16SM90 {
     // s2g copy
     using s2g_copy_atom = SM90_TMA_STORE;
 
-    // we build everything on top of (128, 128, 64), expand m-axis with 2 warp groups
-    // expand k-mode 4 times
-    static_assert(size<0>(CTATile{}) % 128 == 0);
-    static_assert(size<1>(CTATile{}) % 128 == 0);
-    static_assert(size<2>(CTATile{}) % 64 == 0);
+    // tiled mma, 2 warp group (128, 128, 16)
+    using TiledMMA = decltype(make_tiled_mma(mma_op{}, make_layout(make_shape(_2{}, _1{}, _1{}))));
+
+    // tiled copy
+    // g2s AB (128, 64), just a placeholder here, acutal defined in `build_tma_descriptor`
+    using G2STmaCopyA = TmaDescriptor;
+    using G2STmaCopyB = TmaDescriptor;
+    // r2s C (128, 16), TODO: use my layout tv & tilermn
+    using R2STiledCopy = decltype(make_tiled_copy_C_atom(r2s_copy_atom{}, TiledMMA{}));
+    // s2g tiled copy (128, 16)
+    using S2GTmaCopyC = TmaDescriptor; 
 
     // smem swizzle
     using SmemABAtom = GMMA::Layout_K_SW128_Atom<Dtype>; // 64 fp16 % 128Bytes == 0
     using SmemCAtom = GMMA::Layout_K_SW128_Atom<Dtype>;
     using SmemLayoutA = decltype(tile_to_shape(SmemABAtom, make_shape(size<0>(CTATile{}), size<2>(CTATile{}), Int<Stages>))); 
     using SmemLayoutB = decltype(tile_to_shape(SmemABAtom, make_shape(size<1>(CTATile{}), size<2>(CTATile{}), Int<Stages>))); 
-    // TODO: test other tile shape
-    using SmemLayoutC = decltype(tile_to_shape(SmemCAtom, make_shape(_64{}, _64{}, _2{})));
-
-    // tiled mma, 2 warp group
-    using TiledMMA = decltype(make_tiled_mma(mma_op{}, make_layout(make_shape(_2{}, _1{}, _1{}))));
-
-    // tiled copy
-    // g2s AB, just a placeholder here, acutal defined in `build_tma_descriptor`
-    using G2STmaCopyA = TmaDescriptor;
-    using G2STmaCopyB = TmaDescriptor;
-    // r2s C
-    using R2STiledCopy = decltype(make_tiled_copy_C(r2s_copy_atom{}, TiledMMA{}));
-    // s2g tiled copy
-    using S2GTmaCopyC = TmaDescriptor; 
+    // TODO: bigger pad, more pipe
+    using SmemLayoutC = decltype(tile_to_shape(SmemCAtom, make_shape(_128{}, _16{}, _2{})));
+    
+    // cta tile must be divisible by all second level tile
+    static_assert(size<0>(CTATile{}) % 128 == 0);
+    static_assert(size<1>(CTATile{}) % 128 == 0);
+    static_assert(size<2>(CTATile{}) % 64 == 0);
 
     CUTE_HOST
     auto build_tma_descriptor(Dtype* Aptr, Dtype* Bptr, Dtype* Cptr,
@@ -208,15 +206,11 @@ struct GemmFp16SM90 {
         int warp_group_id_in_consumer = __shfl_sync(0xffffffff, threadIdx.x / 128 - 1, 0);
         // auto thr_mma = tiled_mma.get_slice(threadIdx.x - 128); // TODO: try this
         auto thr_mma = tiled_mma.get_slice(warp_group_id_in_consumer * 128);
-        // mma partition
-        Tensor t_sA = thr_mma.partition_A(sA); // ((mma_m, mma_k), rest_m, rest_k, stages)
-        Tensor t_sB = thr_mma.partition_B(sB); // ((mma_n, mma_k), rest_n, rest_k, stages)
-
         // mma fragments
-        Tensor t_rA = thr_mma.partition_fragment_A(t_sA);   // (1, rest_m, rest_k, stages) matrix descriptor
-        Tensor t_rB = thr_mma.partition_fragment_B(t_sB);   // (1, rest_n, rest_k, stages)
-        Tensor t_rC = thr_mma.partition_fragment_C(make_layout(make_shape(size<0>(CTATile{}), size<1>(CTATile{})), 
-                                                               LayoutRight{})); // (COPY_C, rest_m, rest_n)
+        Tensor t_rA = thr_mma.make_fragment_A(sA);   // (1, rest_m, rest_k, stages) matrix descriptor
+        Tensor t_rB = thr_mma.make_fragment_B(sB);   // (1, rest_n, rest_k, stages)
+        Tensor t_rC = thr_mma.make_fragment_C(make_layout(make_shape(size<0>(CTATile{}), size<1>(CTATile{})), 
+                                                               LayoutRight{})); // (CPY, rest_m, rest_n)
 
         // ctas to launch arrive, make sure cta in the same cluster complete mma together
         uint32_t lane_idx = threadIdx.x % 32;
@@ -242,7 +236,7 @@ struct GemmFp16SM90 {
                 smem.empty_barriers[pipe_states.stage_idx].arrive(lane_idx, predicate);
             }
 
-            // TODO: epilogue
+            // TODO: epilogue double buffer pipeline
             scheduler.advance_next_tile();
             tile_info = scheduler.get_tile_id();
         }
