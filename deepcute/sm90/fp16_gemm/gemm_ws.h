@@ -13,6 +13,8 @@ struct GemmFp16SM90 {
     using Dtype = half_t;
     // cluster shape
     using ClusterShape = std::conditional_t<Multicast, decltype(make_shape(_2{}, _1{}, _1{})),  decltype(make_shape(_1{}, _1{}, _1{}))>
+    // scheduler
+    using Scheduler = PersistantScheduler<Shape<int, int, int>, CTATile, ClusterShape>;
 
     // mma atom
     using mma_op = GMMA::MMA_64x128x16_F16F16F16_SS<GMMA::Major::K,  GMMA::Major::K>;
@@ -52,7 +54,7 @@ struct GemmFp16SM90 {
     static_assert(size<2>(CTATile{}) % 64 == 0);
 
     CUTE_HOST
-    auto build_tma_descriptor(Dtype* Aptr, Dtype* Bptr, Dtype* Cptr,
+    static auto build_tma_descriptor(Dtype* Aptr, Dtype* Bptr, Dtype* Cptr,
                               int M, int N, int K){
         using T = Dtype;
         Tensor A = make_tensor(make_gmem_ptr<T>(Aptr), make_layout(make_shape(M, K), make_stride(K, _1{})));
@@ -148,7 +150,7 @@ struct GemmFp16SM90 {
         Tensor t_g2s_sB = thr_g2s_b.partition_D(sB(_, _, 0)); // ((cta_n, cta_k), 1, 1)
 
         // scheduler
-        PersistantScheduler scheduler;
+        Scheduler scheduler(Shape<M, N, K>{}, 4);
         auto tile_info = scheduler.get_tile_id();
 
         // pipeline stages init, TODO: init empty phase to 1 instead
@@ -166,10 +168,10 @@ struct GemmFp16SM90 {
             for (int i = 0; i < num_k; i++) {
                 smem.empty_barriers[pipe_states.stage_idx].wait(pipe_states.phase);
                 smem.full_barriers[pipe_states.stage_idx].arrive_and_expect_tx(Expect_Btyes_AB);
-                copy(tma.with(reinterpret_cast<uint64_t*>(smem.empty_barriers[i])),
+                copy(tma_a.with(reinterpret_cast<uint64_t*>(smem.empty_barriers[i])),
                      t_g2s_gA(_, _, _, tile_info.m_idx, i), t_g2s_sA);
-                copy(tma.with(reinterpret_cast<uint64_t*>(smem.empty_barriers[i])),
-                     t_g2s_gA(_, _, _, tile_info.m_idx, i), t_g2s_sA);
+                copy(tma_b.with(reinterpret_cast<uint64_t*>(smem.empty_barriers[i])),
+                     t_g2s_gB(_, _, _, tile_info.m_idx, i), t_g2s_sB);
                 pipe_states++;
             }
             scheduler.advance_next_tile();
@@ -194,10 +196,10 @@ struct GemmFp16SM90 {
         Tensor sB = make_tensor(make_smem_ptr<T>(smem.B.data()), SmemLayoutB{});    // (cta_n, cta_k, k)
         Tensor sC = make_tensor(make_smem_ptr<T>(smem.C.data()), SmemLayoutC{});
         // make C gmem/tma tensor
-        Tensor C = tma_a.get_tma_tensor(make_shape(M, N));
+        Tensor C = tma_c.get_tma_tensor(make_shape(M, N));
         Tensor gC = local_tile(C, CTATile{}, make_coord(_, _, _), Step<_1, _1, X>{}); // (cta_m, cta_n, m, n)
 
-        PersistantScheduler scheduler;
+        Scheduler scheduler(Shape<M, N, K>{}, 4);
         PipelineStates pipe_states{0, 0};
 
         // mma 
@@ -216,12 +218,6 @@ struct GemmFp16SM90 {
         uint32_t lane_idx = threadIdx.x % 32;
         uint32_t predicate = MultiCast ? lane_idx == 0 : lane_idx < 2;
 
-        // to save register C to smem first then use tma to copy to gmem
-        R2STiledCopy tiled_r2s;
-        auto thr_r2s = tiled_r2s.get_slice(threadIdx.x - 128);
-        auto t_r2s_rC = thr_r2s.retile_S(t_rC);     // (CPY, rest_m = CTA_M / MMA_M, rest_n)
-        auto t_r2s_sC = thr_r2s.partition_D(sC);    // (CPY, rest_n = EPI_M / MMA_M, rest_n, PIPE)
-
         // try to do the loop, and see what is missing
         int num_k = K / size<2>(CTATile{});
         auto tile_info = scheduler.get_tile_id(); 
@@ -231,18 +227,73 @@ struct GemmFp16SM90 {
             for (int i = 0; i < num_k; i++) {
                 // do mma
                 smem.full_barriers[pipe_states.stage_idx].wait(pipe_states.phase);
+                warpgroup_fence_operand(t_rC);
+                warpgroup_arrive();
                 gemm(tiled_mma, t_rA(_, _, _, pipe_states.stage_idx), t_rB(_, _, _, pipe_states.stage_idx), t_rC);
+                warpgroup_fence_operand(t_rC);
+                warpgroup_commit_batch();
                 pipe_states++;
+                // wait for mma complete, and update empty barrier
+                warpgroup_wait<0>();
                 smem.empty_barriers[pipe_states.stage_idx].arrive(lane_idx, predicate);
             }
+            
+            // to save register C to smem first then use tma to copy to gmem
+            R2STiledCopy tiled_r2s;
+            auto thr_r2s = tiled_r2s.get_slice(threadIdx.x - 128);
+            Tensor t_r2s_rC = thr_r2s.retile_S(t_rC);     // (CPY, rest_m = CTA_M / MMA_M, rest_n) (8, 1, 8)
+            Tensor t_r2s_sC = thr_r2s.partition_D(sC);    // (CPY, rest_n = EPI_M / MMA_M, rest_n, PIPE) (8, 1, 1, 2)
+            // tma_c itself is both the data & tiled copy
+            auto thr_s2g = tma_c.get_slice(0);
+            Tensor t_s2g_sC = thr_s2g.partition_S(sC(_, _, 0)); // ((epil_m, epil_n), 1, 1, 2)
+            Tensor t_s2g_gC = thr_s2g.partition_D(gC); // ((epil_m, epil_n), cta_m/epil_m, cta_n/epil_n, m, n) ((128, 16), 1, 8, m, n)
+            // group for better look index
+            Tensor t_r2s_rC_group = group_modes<1, 3>(t_r2s_rC); // (8, 8)
+            Tensor t_r2s_sC_group = group_modes<1, 4>(t_r2s_sC); // (8, 2)
+            Tensor t_s2g_sC_group = group_modes<1, 3>(t_s2g_sC); // ((128, 16), 2)
+            Tensor t_s2g_gC_group = group_modes<1, 3>(t_s2g_gC); // ((128, 16), 8, m, n)
 
-            // TODO: epilogue double buffer pipeline
+            int num_pads = size<2>(t_r2s_rC);
+            int pipe = size<3>(t_r2s_sC);
+            bool tma_predicate = (threadIdx.x - 128) == 0;
+            
+            for (int i = 0; i < num_pads; i += pipe) {
+                for (int j = 0; j < pipe; j++) {
+                    copy(tiled_r2s, t_r2s_rC(_, i + j), t_r2s_sC(_, j));
+                }
+                tma_store_fence();
+                // tma copy
+                if (tma_predicate) {
+                    for (int j = 0; j < pipe; j++) {
+                        copy(tma_c, t_s2g_sC_group(_, j), t_s2g_gC(_, i + j, tile_info.m_idx, tile_info.n_idx));
+                        tma_store_arrive(); // TODO: can we use tma_desc_commit_group?
+                    }
+                }
+                tma_store_wait<0>();
+            }
+            
             scheduler.advance_next_tile();
             tile_info = scheduler.get_tile_id();
         }
     }
 
+    inline static cudaLaunchConfig_t get_launch_config(cudaStream_t stream = 0){
+        cudaLaunchConfig_t launch_config;
+        cudaLaunchAttribute launch_attr;
+        launch_config.gridDim = Scheduler::get_grid_dim();
+        launch_config.blockDim = {3*128}; // 3 warpgroups
+        launch_config.dynamicSmemBytes = sizeof(SharedStorage);
+        launch_config.stream = stream;
 
-    inline static cudaLaunchConfig_t get_launch_config(){}
+        // cluster
+        launch_attr.id = cudaLaunchAttributeClusterDimension;
+        launch_attr.val.clusterDim = {size<0>(ClusterShape{}),
+                                    size<1>(ClusterShape{}),
+                                    size<2>(ClusterShape{})};
+        launch_config.numAttrs = 1;
+        launch_config.attrs = &launch_attr;
+
+        return launch_config;
+    }
 
 };
