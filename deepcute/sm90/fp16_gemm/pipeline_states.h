@@ -21,7 +21,7 @@ struct PipelineStates {
         // directly advance more steps
         // see how many full Stages does the step advanced
         if (((stage_idx + steps) / Stages) % 2 == 1) {
-            phase ^= 1
+            phase ^= 1;
         }
         stage_idx = (stage_idx + steps) % Stages;
     }

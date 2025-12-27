@@ -58,9 +58,12 @@ public:
     int cluster_m_shape;  // m cluster
     int cluster_n_blocks; // n blocks
     int k_loop_cnt;
+    CUTE_HOST_DEVICE
+    Param() = default;  // Default constructor
+    CUTE_HOST_DEVICE
     Param(Problem_size problem_size, int swizzle)
-        : swizzle_(swizzle), cluster_n_shape(size<1>(cluster_shape)),
-          cluster_m_shape(size<0>(cluster_shape)) {
+        : swizzle_(swizzle), cluster_n_shape(size<1>(Cluster_shape{})),
+          cluster_m_shape(size<0>(Cluster_shape{})) {
       assert((swizzle_ & (swizzle_ - 1)) == 0 &&
              "tile scheduler swizzle is limited to power of 2");
       auto tile_size = CTA_tile{};

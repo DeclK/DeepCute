@@ -4,9 +4,9 @@
 #include "gemm_ws.h"
 
 template <typename Kernel>
-__global__ void kernel_wrapper_sm90(cute::TmaDescriptor tma_a,
-                                    cute::TmaDescriptor tma_b,
-                                    cute::TmaDescriptor tma_c,
+__global__ void kernel_wrapper_sm90(__grid_constant__ const typename Kernel::G2STmaCopyA tma_a,
+                                    __grid_constant__ const typename Kernel::G2STmaCopyB tma_b,
+                                    __grid_constant__ const typename Kernel::S2GTmaCopyC tma_c,
                                     int M, int N, int K) {
     Kernel gemm;
     gemm(tma_a, tma_b, tma_c, M, N, K);

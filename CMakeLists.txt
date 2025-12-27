@@ -4,7 +4,7 @@ project(cute_learning LANGUAGES CUDA CXX)
 # CUDA
 enable_language(CUDA)
 set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES 80)
+set(CMAKE_CUDA_ARCHITECTURES 90)
 
 # CXX
 set(CMAKE_CXX_STANDARD 17)
@@ -22,7 +22,7 @@ include_directories(
 
 # set flag var
 set(CUTE_LEARNING_FLAGS 
-    "-arch=sm_80"
+    "-arch=sm_90"
     "-std=c++17"
     "--expt-relaxed-constexpr"
     "--use_fast_math"
@@ -30,7 +30,7 @@ set(CUTE_LEARNING_FLAGS
 )
 
 # Create executables
-add_executable(gemm "deepcute/sm80/naive_gemm/gemm_multistage.cu")
+add_executable(gemm "deepcute/sm90/fp16_gemm/gemm_ws.cu")
 
 # Set CUDA compilation flags
 target_compile_options(gemm PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CUTE_LEARNING_FLAGS}>)
