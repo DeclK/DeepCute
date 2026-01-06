@@ -17,10 +17,11 @@ struct GemmFp16SM90 {
     using Scheduler = PersistantScheduler<Shape<int, int, int>, CTATile, ClusterShape>;
 
     // mma atom
-    using mma_op = GMMA::MMA_64x128x16_F16F16F16_SS<GMMA::Major::K,  GMMA::Major::K>;
+    // using mma_op = GMMA::MMA_64x128x16_F16F16F16_SS<GMMA::Major::K,  GMMA::Major::K>;
+    using mma_op = GMMA::MMA_64x64x16_F16F16F16_SS<GMMA::Major::K,  GMMA::Major::K>;
 
     // smem swizzle
-    using SmemABAtom = GMMA::Layout_K_SW128_Atom<Dtype>; // (8, 64) 64 fp16 % 128Bytes == 0
+    using SmemABAtom = GMMA::Layout_K_SW64_Atom<Dtype>; // (8, 64) 64 fp16 % 128Bytes == 0
     using SmemCAtom = GMMA::Layout_K_SW32_Atom<Dtype>;
     using SmemLayoutA = decltype(tile_to_shape(SmemABAtom{}, make_shape(size<0>(CTATile{}), size<2>(CTATile{}), Int<Stages>{}))); 
     using SmemLayoutB = decltype(tile_to_shape(SmemABAtom{}, make_shape(size<1>(CTATile{}), size<2>(CTATile{}), Int<Stages>{}))); 
@@ -51,8 +52,8 @@ struct GemmFp16SM90 {
 
     // cta tile must be divisible by all second level tile
     static_assert(size<0>(CTATile{}) % 128 == 0);
-    static_assert(size<1>(CTATile{}) % 128 == 0);
-    static_assert(size<2>(CTATile{}) % 64 == 0);
+    static_assert(size<1>(CTATile{}) % 64 == 0);
+    static_assert(size<2>(CTATile{}) % 32 == 0);
 
     CUTE_HOST
     static auto build_tma_descriptor(Dtype* Aptr, Dtype* Bptr, Dtype* Cptr,
@@ -86,7 +87,8 @@ struct GemmFp16SM90 {
         using MBarrier = cutlass::arch::ClusterTransactionBarrier;
         
         // smem align to 1024 bytes for swizzle-128B, check if this is legal
-        extern __shared__ __align__(1024) SharedStorage smem; 
+        extern __shared__ uint8_t smem_buffer[];
+        SharedStorage& smem = *reinterpret_cast<SharedStorage*>(smem_buffer); 
 
         // choose only 1 thread to prefetch tma & init mbarriers
         // TODO: what's the difference of using thread(0, 0)?
@@ -281,8 +283,8 @@ struct GemmFp16SM90 {
     }
 
     inline static cudaLaunchConfig_t get_launch_config(cudaStream_t stream = 0){
-        cudaLaunchConfig_t launch_config;
-        cudaLaunchAttribute launch_attr;
+        static cudaLaunchConfig_t launch_config;
+        static cudaLaunchAttribute launch_attr;
         launch_config.gridDim = Scheduler::get_grid_dim();
         launch_config.blockDim = {3*128}; // 3 warpgroups
         launch_config.dynamicSmemBytes = sizeof(SharedStorage);
@@ -291,8 +293,8 @@ struct GemmFp16SM90 {
         // cluster
         launch_attr.id = cudaLaunchAttributeClusterDimension;
         launch_attr.val.clusterDim = {size<0>(ClusterShape{}),
-                                    size<1>(ClusterShape{}),
-                                    size<2>(ClusterShape{})};
+                                      size<1>(ClusterShape{}),
+                                      size<2>(ClusterShape{})};
         launch_config.numAttrs = 1;
         launch_config.attrs = &launch_attr;
 

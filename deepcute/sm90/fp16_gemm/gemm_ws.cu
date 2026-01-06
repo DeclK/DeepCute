@@ -29,8 +29,8 @@ int main() {
     A.sync_device();
     B.sync_device();
     
-    using CTATile = Shape<_128, _128, _64>;
-    using GemmKernel = GemmFp16SM90<CTATile, true, 6>;
+    using CTATile = Shape<_128, _64, _32>;
+    using GemmKernel = GemmFp16SM90<CTATile, true, 3>;
     auto launch_config = GemmKernel::get_launch_config();
     auto [tma_a, tma_b, tma_c] = GemmKernel::build_tma_descriptor(
         A.device_data(),
@@ -44,6 +44,9 @@ int main() {
         GpuTimer timer;
         timer.start();
         for (int i = 0; i < repeat; ++i) {
+            CUDA_CHECK(cudaFuncSetAttribute(kernel_wrapper_sm90<GemmKernel>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             launch_config.dynamicSmemBytes));
             CUDA_CHECK(cudaLaunchKernelEx(&launch_config, 
                                           kernel_wrapper_sm90<GemmKernel>,
                                           tma_a,
