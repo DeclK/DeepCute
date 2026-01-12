@@ -31,7 +31,7 @@ struct GemmFp16SM90 {
     // copy atom
     // g2s copy, using tma
     using g2s_copy_atom_a = SM90_TMA_LOAD;
-    using g2s_copy_atom_b = std::conditional_t<MultiCast, SM90_TMA_LOAD, SM90_TMA_LOAD_MULTICAST>;
+    using g2s_copy_atom_b = std::conditional_t<MultiCast, SM90_TMA_LOAD_MULTICAST, SM90_TMA_LOAD>;
     // r2s copy
     using r2s_copy_atom = Copy_Atom<SM90_U32x4_STSM_N, Dtype>;
     // s2g copy
@@ -55,33 +55,32 @@ struct GemmFp16SM90 {
     static_assert(size<1>(CTATile{}) % 64 == 0);
     static_assert(size<2>(CTATile{}) % 32 == 0);
 
-    CUTE_HOST
-    static auto build_tma_descriptor(Dtype* Aptr, Dtype* Bptr, Dtype* Cptr,
+    static auto build_tma_descriptor(Dtype* const& Aptr, Dtype* const& Bptr, Dtype* const& Cptr,
                               int M, int N, int K){
         using T = Dtype;
-        Tensor A = make_tensor(make_gmem_ptr<T>(Aptr), make_layout(make_shape(M, K), make_stride(K, _1{})));
-        Tensor B = make_tensor(make_gmem_ptr<T>(Bptr), make_layout(make_shape(N, K), make_stride(K, _1{})));
-        Tensor C = make_tensor(make_gmem_ptr<T>(Cptr), make_layout(make_shape(M, N), make_stride(N, _1{})));
+        Tensor A = make_tensor(make_gmem_ptr<T const>(Aptr), make_layout(make_shape(M, K), make_stride(K, _1{})));
+        Tensor B = make_tensor(make_gmem_ptr<T const>(Bptr), make_layout(make_shape(N, K), make_stride(K, _1{})));
+        Tensor C = make_tensor(make_gmem_ptr<T const>(Cptr), make_layout(make_shape(M, N), make_stride(N, _1{})));
         auto tma_a = make_tma_copy(g2s_copy_atom_a{}, A, SmemLayoutA{}(_, _, 0), size<1>(ClusterShape{}));
         auto tma_b = make_tma_copy(g2s_copy_atom_b{}, B, SmemLayoutB{}(_, _, 0), size<0>(ClusterShape{}));
         auto tma_c = make_tma_copy(s2g_copy_atom{}, C, SmemLayoutC{}(_, _, 0), size<2>(ClusterShape{}));
         return make_tuple(tma_a, tma_b, tma_c);
     }
 
-    struct SharedStorage {
+    struct alignas(128) SharedStorage {
         using MBarrier = cutlass::arch::ClusterTransactionBarrier;
-        array<Dtype, cosize(SmemLayoutA{})> A;
-        array<Dtype, cosize(SmemLayoutB{})> B;
-        array<Dtype, cosize(SmemLayoutC{})> C;
-        MBarrier full_barriers[Stages];
-        MBarrier empty_barriers[Stages];
+        alignas(128) array_aligned<Dtype, cosize_v<SmemLayoutA>> A;
+        alignas(128) array_aligned<Dtype, cosize_v<SmemLayoutB>> B;
+        alignas(128) array_aligned<Dtype, cosize_v<SmemLayoutC>> C;
+        alignas(16) MBarrier full_barriers[Stages];
+        alignas(16) MBarrier empty_barriers[Stages];
         // TODO: check the align bytes here
     };
 
     CUTE_DEVICE
-    void operator()(G2STmaCopyA tma_a,
-                    G2STmaCopyB tma_b,
-                    S2GTmaCopyC tma_c,
+    void operator()(G2STmaCopyA const& tma_a,
+                    G2STmaCopyB const& tma_b,
+                    S2GTmaCopyC const& tma_c,
                     int M, int N, int K) {
         using T = Dtype;
         using MBarrier = cutlass::arch::ClusterTransactionBarrier;
@@ -148,16 +147,16 @@ struct GemmFp16SM90 {
 
         // partition data
         Tensor t_g2s_gA = thr_g2s_a.partition_S(gA); // ((cta_m, cta_k), 1, 1, m, k)
-        Tensor t_g2s_sA = thr_g2s_a.partition_D(sA(_, _, 0)); // ((cta_m, cta_k), 1, 1)
+        Tensor t_g2s_sA = thr_g2s_a.partition_D(sA); // ((cta_m, cta_k), 1, 1, Stages)
         Tensor t_g2s_gB = thr_g2s_b.partition_S(gB); // ((cta_n, cta_k), 1, 1, n, k)
-        Tensor t_g2s_sB = thr_g2s_b.partition_D(sB(_, _, 0)); // ((cta_n, cta_k), 1, 1)
+        Tensor t_g2s_sB = thr_g2s_b.partition_D(sB); // ((cta_n, cta_k), 1, 1, Stages)
 
         // scheduler
         Scheduler scheduler(make_shape(M, N, K), 4);
         auto tile_info = scheduler.get_tile_id();
 
         // pipeline stages init, TODO: init empty phase to 1 instead
-        PipelineStates<Stages> pipe_states{1, 0};
+        PipelineStates<Stages> pipe_states{0, 1};
 
         // calculate expecting bytes
         constexpr int SMEM_A_PerStage = size(SmemLayoutA{}(_, _, 0)) * sizeof(Dtype);
@@ -167,14 +166,14 @@ struct GemmFp16SM90 {
         // producer mainloop
         int num_k = size<3>(gA);
         while (tile_info.is_valid) {
-
             for (int i = 0; i < num_k; i++) {
                 smem.empty_barriers[pipe_states.stage_idx].wait(pipe_states.phase);
+                uint64_t *full_barrier_ptr = reinterpret_cast<uint64_t*>(&smem.full_barriers[pipe_states.stage_idx]);
                 smem.full_barriers[pipe_states.stage_idx].arrive_and_expect_tx(Expect_Btyes_AB);
-                copy(tma_a.with(*reinterpret_cast<uint64_t*>(&smem.full_barriers[i]), 0),
-                     t_g2s_gA(_, _, _, tile_info.m_idx, i), t_g2s_sA);
-                copy(tma_b.with(*reinterpret_cast<uint64_t*>(&smem.full_barriers[i]), mcast_mask_b),
-                     t_g2s_gB(_, _, _, tile_info.m_idx, i), t_g2s_sB);
+                copy(tma_a.with(*full_barrier_ptr),
+                     t_g2s_gA(_, _, _, tile_info.m_idx, i), t_g2s_sA(_, _, _, pipe_states.stage_idx));
+                copy(tma_b.with(*full_barrier_ptr, mcast_mask_b),
+                     t_g2s_gB(_, _, _, tile_info.n_idx, i), t_g2s_sB(_, _, _, pipe_states.stage_idx));
                 pipe_states++;
             }
             scheduler.advance_next_tile();
@@ -183,7 +182,7 @@ struct GemmFp16SM90 {
 
         // make sure all consumers have use data
         for (int i = 0; i < Stages; i++) {
-            smem.empty_barriers[i].wait(pipe_states.phase);
+            smem.empty_barriers[pipe_states.stage_idx].wait(pipe_states.phase);
             pipe_states++;
         }
     }
@@ -220,14 +219,15 @@ struct GemmFp16SM90 {
 
         // ctas to launch arrive, make sure cta in the same cluster complete mma together
         uint32_t lane_idx = threadIdx.x % 32;
-        uint32_t predicate = MultiCast ? lane_idx == 0 : lane_idx < 2;
+        // uint32_t predicate = MultiCast ? lane_idx == 0 : lane_idx < 2;
+        uint32_t predicate = MultiCast ? lane_idx < 2 : lane_idx == 0;
 
         // try to do the loop, and see what is missing
         int num_k = K / size<2>(CTATile{});
         auto tile_info = scheduler.get_tile_id(); 
         while (tile_info.is_valid) {
             // wait the full barrier
-            clear(t_rC);
+            clear(t_rC);// TODO: how to understand the order between clear and wgmma? would wgmma calculate before this clear?
             for (int i = 0; i < num_k; i++) {
                 // do mma
                 smem.full_barriers[pipe_states.stage_idx].wait(pipe_states.phase);
@@ -236,32 +236,33 @@ struct GemmFp16SM90 {
                 gemm(tiled_mma, t_rA(_, _, _, pipe_states.stage_idx), t_rB(_, _, _, pipe_states.stage_idx), t_rC);
                 warpgroup_fence_operand(t_rC);
                 warpgroup_commit_batch();
-                pipe_states++;
                 // wait for mma complete, and update empty barrier
                 warpgroup_wait<0>();
                 smem.empty_barriers[pipe_states.stage_idx].arrive(lane_idx, predicate);
+                pipe_states++;
             }
             
             // to save register C to smem first then use tma to copy to gmem
             R2STiledCopy tiled_r2s;
             auto thr_r2s = tiled_r2s.get_slice(threadIdx.x - 128);
-            Tensor t_r2s_rC = thr_r2s.retile_S(t_rC);     // ((CPY, restv), CTA_M / MMA_M = 1, CTA_N / MMA_N = 1)
-            Tensor t_r2s_sC = thr_r2s.partition_D(sC);    // (CPY, rest_n = EPI_M / MMA_M, rest_n, PIPE) (8, 1, 1, 2)
+            Tensor t_r2s_rC = thr_r2s.retile_S(t_rC);     // ((CPY, restv), CTA_M / MMA_M = 1, CTA_N / MMA_N = 1) TODO: how do we know the layout of restv?
+            Tensor t_r2s_sC = thr_r2s.partition_D(sC);    // (CPY, rest_n = EPI_M / EPI_M, rest_n, PIPE) (8, 1, 1, 2)
             Tensor t_r2s_rC_flatten = t_r2s_rC(repeat<2>(_), _, _);
             // tma_c itself is both the data & tiled copy
             auto thr_s2g = tma_c.get_slice(0);
-            Tensor t_s2g_sC = thr_s2g.partition_S(sC(_, _, 0)); // ((epil_m, epil_n), 1, 1, 2)
+            Tensor t_s2g_sC = thr_s2g.partition_S(sC); // ((epil_m, epil_n), 1, 1, 2)
             Tensor t_s2g_gC = thr_s2g.partition_D(gC); // ((epil_m, epil_n), cta_m/epil_m, cta_n/epil_n, m, n) ((128, 16), 1, 8, m, n)
             // group for better look index
             Tensor t_r2s_rC_group = group_modes<1, 4>(t_r2s_rC_flatten); // (8, 8)
             Tensor t_r2s_sC_group = group_modes<1, 4>(t_r2s_sC); // (8, 2)
-            Tensor t_s2g_sC_group = group_modes<1, 3>(t_s2g_sC); // ((128, 16), 2)
+            Tensor t_s2g_sC_group = group_modes<1, 4>(t_s2g_sC); // ((128, 16), 2)
             Tensor t_s2g_gC_group = group_modes<1, 3>(t_s2g_gC); // ((128, 16), 8, m, n)
 
-            int num_pads = size<2>(t_r2s_rC);
+            int num_pads = size<1>(t_r2s_rC_group);
             int pipe = size<3>(t_r2s_sC);
             bool tma_predicate = (threadIdx.x - 128) == 0;
             
+            cutlass::arch::NamedBarrier(128*2).sync(); // we have to sync here. why? the warpgroup_wait<0> won't help
             for (int i = 0; i < num_pads; i += pipe) {
                 for (int j = 0; j < pipe; j++) {
                     copy(tiled_r2s, t_r2s_rC_group(_, i + j), t_r2s_sC_group(_, j));
@@ -273,8 +274,10 @@ struct GemmFp16SM90 {
                         copy(tma_c, t_s2g_sC_group(_, j), t_s2g_gC_group(_, i + j, tile_info.m_idx, tile_info.n_idx));
                         tma_store_arrive(); // TODO: can we use tma_desc_commit_group?
                     }
+                    tma_store_wait<0>();
                 }
-                tma_store_wait<0>();
+                // sync here
+                cutlass::arch::NamedBarrier(128*2).sync();
             }
             
             scheduler.advance_next_tile();

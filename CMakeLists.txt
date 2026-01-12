@@ -4,7 +4,7 @@ project(cute_learning LANGUAGES CUDA CXX)
 # CUDA
 enable_language(CUDA)
 set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_ARCHITECTURES 90)
+set(CMAKE_CUDA_ARCHITECTURES 90a)
 
 # CXX
 set(CMAKE_CXX_STANDARD 17)
@@ -22,7 +22,7 @@ include_directories(
 
 # set flag var
 set(CUTE_LEARNING_FLAGS 
-    "-arch=sm_90"
+    "-arch=sm_90a"
     "-std=c++17"
     "--expt-relaxed-constexpr"
     "--use_fast_math"

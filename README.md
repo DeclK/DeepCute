@@ -21,19 +21,22 @@ This repo is designed for following purposes:
 - [x] sm80 fp16 gemm
 - [ ] sm80 int8 gemm
 - [ ] sm80 int4 gemm
-- [ ] sm90 fp16 gemm
+- [x] sm90 fp16 gemm
 - [ ] sm90 fp8 deepgemm
 - [ ] sm90 int8 gemm
-- [ ] fused layernorm + convert fp8 kernel
-- [ ] fused silu_matmul + convert fp8 kernel
-- [ ] sm100 fp16 gemm
-- [ ] sm100 fp8 deepgemm
-- [ ] sm100 nvfp4 gemm
-- [ ] grouped gemm
-- [ ] benchmark of all kernels
-- [ ] predicated kernels
+- [ ] fused layernorm + convert low-bit kernel
+- [ ] fused silu_matmul + convert low-bit kernel
+- [ ] sm120 fp16 gemm
+- [ ] sm120 fp8 deepgemm
+- [ ] sm120 nvfp4 gemm
 - [ ] JiT in python
+- [ ] benchmark of all kernels
+- [ ] grouped gemm kernels
+- [ ] predicated kernels
+- [ ] mixed precision kernels
 - [ ] attention kernels
+
+If I have finished previous 13 items, then this project can go public, and utilze the wisdom of the community.
 
 ## Acknowledgments
 
