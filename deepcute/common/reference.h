@@ -14,7 +14,7 @@ cutlass_gemmTN_ref(cutlass::HostTensor<Atype, ALayout> const &A, // row-major
                    cutlass::HostTensor<Btype, BLayout> const &B, // col-major
                    cutlass::HostTensor<Ctype, CLayout> &C,
                    Ctype alpha = static_cast<Ctype>(1),
-                   Ctype beta = static_cast<Ctype>(0), int repeat = 1000) {
+                   Ctype beta = static_cast<Ctype>(0), int repeat = 100) {
   int m = A.extent().row();
   int n = B.extent().column();
   int k = A.extent().column();
@@ -37,7 +37,7 @@ cutlass_gemmTN_ref(cutlass::HostTensor<Atype, ALayout> const &A, // row-major
   timer.stop();
   float duration_ms = timer.elapsed_millis() / repeat;
   float tflops = gflop / duration_ms;
-  printf("cutlass ref: %f tflops\n", tflops);
+  printf("cutlass ref: %f ms\n", duration_ms);
 }
 
 template <typename T>
