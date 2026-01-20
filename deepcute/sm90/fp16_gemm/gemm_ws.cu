@@ -29,7 +29,7 @@ int main() {
     A.sync_device();
     B.sync_device();
     
-    using CTATile = Shape<_128, _64, _32>;
+    using CTATile = Shape<_128, _256, _64>;
     using GemmKernel = GemmFp16SM90<CTATile, true, 3>;
     auto launch_config = GemmKernel::get_launch_config();
     auto [tma_a, tma_b, tma_c] = GemmKernel::build_tma_descriptor(

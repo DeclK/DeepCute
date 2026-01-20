@@ -19,17 +19,15 @@ struct GemmFp16SM90 {
     using Scheduler = PersistantScheduler<Shape<int, int, int>, CTATile, ClusterShape>;
 
     // mma atom
-    // using mma_op = GMMA::MMA_64x128x16_F16F16F16_SS<GMMA::Major::K,  GMMA::Major::K>;
-    using mma_op = GMMA::MMA_64x64x16_F16F16F16_SS<GMMA::Major::K,  GMMA::Major::K>;
-    // using mma_op = GMMA::MMA_64x64x16_F32F16F16_SS<GMMA::Major::K,  GMMA::Major::K>;
+    using mma_op = GMMA::MMA_64x256x16_F16F16F16_SS<GMMA::Major::K,  GMMA::Major::K>;
+    // using mma_op = GMMA::MMA_64x256x16_F32F16F16_SS<GMMA::Major::K,  GMMA::Major::K>;
 
     // smem swizzle
-    using SmemABAtom = GMMA::Layout_K_SW64_Atom<Dtype>; // (8, 64) 64 fp16 % 128Bytes == 0
-    using SmemCAtom = GMMA::Layout_K_SW32_Atom<Dtype>;
+    using SmemABAtom = GMMA::Layout_K_SW128_Atom<Dtype>; // (8, 64) 64 fp16 % 128Bytes == 0
+    using SmemCAtom = GMMA::Layout_K_SW128_Atom<Dtype>;
     using SmemLayoutA = decltype(tile_to_shape(SmemABAtom{}, make_shape(size<0>(CTATile{}), size<2>(CTATile{}), Int<Stages>{}))); 
     using SmemLayoutB = decltype(tile_to_shape(SmemABAtom{}, make_shape(size<1>(CTATile{}), size<2>(CTATile{}), Int<Stages>{}))); 
-    // TODO: bigger pad, more pipe
-    using SmemLayoutC = decltype(tile_to_shape(SmemCAtom{}, make_shape(_128{}, _64{}, _1{}), Step<_1, _2, _3>{}));
+    using SmemLayoutC = decltype(tile_to_shape(SmemCAtom{}, make_shape(size<0>(CTATile{}), size<1>(CTATile{}), _1{}), Step<_1, _2, _3>{}));
     
     // copy atom
     // g2s copy, using tma
@@ -255,40 +253,37 @@ struct GemmFp16SM90 {
             Tensor t_s2g_sC_group = group_modes<1, 4>(t_s2g_sC); // ((128, 16), 2)
             Tensor t_s2g_gC_group = group_modes<1, 3>(t_s2g_gC); // ((128, 16), 8, m, n)
 
-            int num_pads = size<1>(t_r2s_rC_group);
-            int pipe = size<1>(t_r2s_sC_group);
             bool tma_predicate = (threadIdx.x - 128) == 0;
             
-            cutlass::arch::NamedBarrier(128*2).sync(); // TODO: why do we have to sync here?
-            for (int i = 0; i < num_pads; i += pipe) {
-                for (int j = 0; j < pipe; j++) {
-                    if constexpr (std::is_same_v<AccType, float>) {
-                        Tensor tmp_tensor = make_tensor_like<Dtype>(t_r2s_rC_group);
-                        auto convert_float2half = [&](auto& float_tensor, auto& half_tensor) {
-                            for (int i = 0; i < size(float_tensor); i ++) {
-                                half_tensor(i) = __float2half(float_tensor(i));
-                            }
-                        };
-                        convert_float2half(t_r2s_rC_group, tmp_tensor);
-                        copy(tiled_r2s, tmp_tensor(_, i + j), t_r2s_sC_group(_, j));
-                    }
-                    else {
-                        copy(tiled_r2s, t_r2s_rC_group(_, i + j), t_r2s_sC_group(_, j));
-                    }
+            // make sure previous s2g is finished
+            tma_store_wait<0>();
+            cutlass::arch::NamedBarrier(128*2).sync();
+            // r2s copy
+            for (int i = 0; i < size<1>(t_r2s_sC_group); i++) {
+                // if using float accumulators, convert to half first
+                if constexpr (std::is_same_v<AccType, float>) {
+                    Tensor tmp_tensor = make_tensor_like<Dtype>(t_r2s_rC_group);
+                    auto convert_float2half = [&](auto& float_tensor, auto& half_tensor) {
+                        for (int i = 0; i < size(float_tensor); i++) {
+                            half_tensor(i) = __float2half(float_tensor(i));
+                        }
+                    };
+                    convert_float2half(t_r2s_rC_group, tmp_tensor);
+                    copy(tiled_r2s, tmp_tensor(_, i), t_r2s_sC_group(_, i));
                 }
-                tma_store_fence();
-                // tma copy
-                if (tma_predicate) {
-                    for (int j = 0; j < pipe; j++) {
-                        copy(tma_c, t_s2g_sC_group(_, j), t_s2g_gC_group(_, i + j, tile_info.m_idx, tile_info.n_idx));
-                        tma_store_arrive(); //  we can also use tma_desc_commit_group
-                    }
-                    tma_store_wait<0>();
+                else {
+                    copy(tiled_r2s, t_r2s_rC_group(_, i), t_r2s_sC_group(_, i));
                 }
-                // sync here
-                cutlass::arch::NamedBarrier(128*2).sync();
             }
-            
+            // s2g copy
+            cutlass::arch::NamedBarrier(128*2).sync();
+            tma_store_fence();
+            if (tma_predicate) {
+                for (int i = 0; i < size<1>(t_s2g_sC_group); i++) {
+                    copy(tma_c, t_s2g_sC_group(_, i), t_s2g_gC_group(_, i, tile_info.m_idx, tile_info.n_idx));
+                    tma_store_arrive(); //  we can also use tma_desc_commit_group
+                }
+            }
             scheduler.advance_next_tile();
             tile_info = scheduler.get_tile_id();
         }
