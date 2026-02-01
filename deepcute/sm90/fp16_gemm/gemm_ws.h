@@ -8,6 +8,20 @@
 
 using namespace cute;
 
+/* A retile impl that can convert register layout from mma partitoined to copy partitioned*/
+template <class RTensor, class ThrMMA, class ThrCopy, class Shape>
+CUTE_HOST_DEVICE constexpr auto
+retile_C_impl(RTensor&& r_tensor, ThrMMA&& thr_mma, ThrCopy&& thr_copy, Shape&& shape) {
+    auto empty_tensor = make_tensor(static_cast<half_t*>(nullptr), make_layout(shape));
+    auto mma2gmem = thr_mma.partition_C(empty_tensor).layout();
+    auto copy2gmem = thr_copy.partition_D(empty_tensor).layout();
+    auto gmem2mma = left_inverse(mma2gmem);
+    auto copy2mma = gmem2mma.compose(copy2gmem);
+    auto copy2rmem = r_tensor.compose(copy2mma);
+    return copy2rmem;
+}
+
+
 template <typename CTATile, bool MultiCast, int Stages>
 struct GemmFp16SM90 {
     using Dtype = half_t;
@@ -46,7 +60,7 @@ struct GemmFp16SM90 {
     using empty_tenor = decltype(make_tensor(static_cast<Dtype const *>(nullptr), make_layout(Shape<int, int>{}, Stride<int, _1>{})));
     using G2STmaCopyA = decltype(make_tma_copy(g2s_copy_atom_a{}, empty_tenor{}, SmemLayoutA{}(_, _, 0), size<1>(ClusterShape{})));
     using G2STmaCopyB = decltype(make_tma_copy(g2s_copy_atom_b{}, empty_tenor{}, SmemLayoutB{}(_, _, 0), size<0>(ClusterShape{})));
-    // r2s C (128, 16), TODO: use my layout tv & tilermn
+    // using R2STiledCopy = decltype(make_tiled_copy_C(r2s_copy_atom{}, TiledMMA{}));
     using R2STiledCopy = decltype(make_tiled_copy_C_atom(r2s_copy_atom{}, TiledMMA{}));
     // s2g tiled copy (128, 16)
     using S2GTmaCopyC = decltype(make_tma_copy(s2g_copy_atom{}, empty_tenor{}, SmemLayoutC{}(_, _, 0)));
@@ -240,18 +254,19 @@ struct GemmFp16SM90 {
             // to save register C to smem first then use tma to copy to gmem
             R2STiledCopy tiled_r2s;
             auto thr_r2s = tiled_r2s.get_slice(threadIdx.x - 128);
-            Tensor t_r2s_rC = thr_r2s.retile_S(t_rC);     // ((CPY, restv), CTA_M / MMA_M = 1, CTA_N / MMA_N = 1) TODO: how do we know the layout of restv?
-            Tensor t_r2s_sC = thr_r2s.partition_D(sC);    // (CPY, rest_n = EPI_M / EPI_M, rest_n, PIPE) (8, 1, 1, 2)
-            Tensor t_r2s_rC_flatten = t_r2s_rC(repeat<2>(_), _, _);
-            // tma_c itself is both the data & tiled copy
+            // Tensor t_r2s_rC = thr_r2s.retile_S(t_rC);     // ((CPY, restv), cta_m/mma_m, cta_n/mma_n)
+            // Tensor t_r2s_rC_flatten = t_r2s_rC(repeat<2>(_), _, _);
+            Tensor t_r2s_rC = retile_C_impl(t_rC, thr_mma, thr_r2s, take<0, 2>(CTATile{})); // (CPY, cta_m/cpy_m, cta_n/cpy_n)
+            Tensor t_r2s_sC = thr_r2s.partition_D(sC);    // (CPY, cta_m/cpy_m, cta_n/cpy_n, pipe=1)
+            // for tma copy, we have cpy_m=cta_m, cpy_n=cta_n
             auto thr_s2g = tma_c.get_slice(0);
-            Tensor t_s2g_sC = thr_s2g.partition_S(sC); // ((epil_m, epil_n), 1, 1, 2)
-            Tensor t_s2g_gC = thr_s2g.partition_D(gC_tma); // ((epil_m, epil_n), cta_m/epil_m, cta_n/epil_n, m, n) ((128, 16), 1, 8, m, n)
+            Tensor t_s2g_sC = thr_s2g.partition_S(sC); // ((cpy_m, cpy_n), cta_m/cpy_m=1, cta_n/cpy_n=1, pipe=1)
+            Tensor t_s2g_gC = thr_s2g.partition_D(gC_tma); // ((cpy_m, cpy_n), cta_m/cpy_m=1, cta_n/cpy_n=1, m, n)
             // group for better look index
-            Tensor t_r2s_rC_group = group_modes<1, 4>(t_r2s_rC_flatten); // (8, 8)
-            Tensor t_r2s_sC_group = group_modes<1, 4>(t_r2s_sC); // (8, 2)
-            Tensor t_s2g_sC_group = group_modes<1, 4>(t_s2g_sC); // ((128, 16), 2)
-            Tensor t_s2g_gC_group = group_modes<1, 3>(t_s2g_gC); // ((128, 16), 8, m, n)
+            Tensor t_r2s_rC_group = group_modes<1, 3>(t_r2s_rC); // (CPY, rest_mn)
+            Tensor t_r2s_sC_group = group_modes<1, 4>(t_r2s_sC); // (CPY, rest_mn)
+            Tensor t_s2g_sC_group = group_modes<1, 4>(t_s2g_sC); // ((cta_m, cta_n), 1)
+            Tensor t_s2g_gC_group = group_modes<1, 3>(t_s2g_gC); // ((cta_m, cta_n), 1, m, n)
 
             bool tma_predicate = (threadIdx.x - 128) == 0;
             
